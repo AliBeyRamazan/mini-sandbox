@@ -1,9 +1,12 @@
 package main
 
 import (
+	"archive/zip"
 	"bufio"
 	"crypto/sha1"
 	"crypto/sha256"
+	"debug/elf"
+	"debug/pe"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -11,6 +14,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,6 +35,13 @@ type runOptions struct {
 	reportsDir    string
 	network       bool
 	keepContainer bool
+}
+
+type inspectOptions struct {
+	target       string
+	reportsDir   string
+	stringsLimit int
+	maxEntries   int
 }
 
 type metadata struct {
@@ -67,6 +78,34 @@ type summary struct {
 	Logs           []string       `json:"logs"`
 }
 
+type inspectReport struct {
+	RunID       string         `json:"run_id"`
+	TargetPath  string         `json:"target_path"`
+	TargetName  string         `json:"target_name"`
+	IsDirectory bool           `json:"is_directory"`
+	Size        int64          `json:"size"`
+	FileType    string         `json:"file_type,omitempty"`
+	MIME        string         `json:"mime,omitempty"`
+	SHA256      string         `json:"sha256,omitempty"`
+	SHA1        string         `json:"sha1,omitempty"`
+	MagicHex    string         `json:"magic_hex,omitempty"`
+	Extension   string         `json:"extension,omitempty"`
+	PE          map[string]any `json:"pe,omitempty"`
+	ELF         map[string]any `json:"elf,omitempty"`
+	Entries     []archiveEntry `json:"entries,omitempty"`
+	Strings     []string       `json:"strings,omitempty"`
+	Notes       []string       `json:"notes,omitempty"`
+	StartedAt   string         `json:"started_at"`
+}
+
+type archiveEntry struct {
+	Path         string `json:"path"`
+	Size         int64  `json:"size"`
+	Compressed   int64  `json:"compressed,omitempty"`
+	IsDirectory  bool   `json:"is_directory"`
+	ModifiedTime string `json:"modified_time,omitempty"`
+}
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -85,6 +124,8 @@ func run(args []string) error {
 		return buildCommand(args[1:])
 	case "run":
 		return runCommand(args[1:])
+	case "inspect":
+		return inspectCommand(args[1:])
 	case "-h", "--help", "help":
 		usage()
 		return nil
@@ -100,10 +141,12 @@ func usage() {
 Usage:
   mini-sandbox build [--tag mini-linux-sandbox:latest]
   mini-sandbox run <sample> [--tag mini-linux-sandbox:latest] [--timeout 15] [--reports-dir reports] [--network] [--keep-container]
+  mini-sandbox inspect <file-or-directory> [--reports-dir reports] [--strings-limit 80] [--max-entries 200]
 
 Commands:
   build    Build the Docker sandbox image.
-  run      Execute a Linux sample in the sandbox and collect logs.`)
+  run      Execute a Linux sample in the sandbox and collect logs.
+  inspect  Statically inspect PDF, EXE, ZIP, DOCX, folders, and other files without executing them.`)
 }
 
 func buildCommand(args []string) error {
@@ -156,6 +199,28 @@ func runCommand(args []string) error {
 	return runSample(opts)
 }
 
+func inspectCommand(args []string) error {
+	fs := flag.NewFlagSet("inspect", flag.ContinueOnError)
+	opts := inspectOptions{}
+	fs.StringVar(&opts.reportsDir, "reports-dir", "reports", "Output directory")
+	fs.IntVar(&opts.stringsLimit, "strings-limit", 80, "Maximum printable strings to collect")
+	fs.IntVar(&opts.maxEntries, "max-entries", 200, "Maximum directory/archive entries to collect")
+	if err := fs.Parse(normalizeInspectArgs(args)); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("inspect requires exactly one file or directory path")
+	}
+	opts.target = fs.Arg(0)
+	if opts.stringsLimit < 0 {
+		return fmt.Errorf("--strings-limit cannot be negative")
+	}
+	if opts.maxEntries < 1 {
+		return fmt.Errorf("--max-entries must be at least 1")
+	}
+	return inspectTarget(opts)
+}
+
 func normalizeRunArgs(args []string) []string {
 	boolFlags := map[string]bool{
 		"-network":         true,
@@ -192,6 +257,37 @@ func normalizeRunArgs(args []string) []string {
 		default:
 			positionals = append(positionals, arg)
 		}
+	}
+	return append(flags, positionals...)
+}
+
+func normalizeInspectArgs(args []string) []string {
+	valueFlags := map[string]bool{
+		"-reports-dir":    true,
+		"--reports-dir":   true,
+		"-strings-limit":  true,
+		"--strings-limit": true,
+		"-max-entries":    true,
+		"--max-entries":   true,
+	}
+
+	var flags []string
+	var positionals []string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		name := arg
+		if idx := strings.IndexRune(arg, '='); idx >= 0 {
+			name = arg[:idx]
+		}
+		if valueFlags[name] {
+			flags = append(flags, arg)
+			if !strings.Contains(arg, "=") && i+1 < len(args) {
+				i++
+				flags = append(flags, args[i])
+			}
+			continue
+		}
+		positionals = append(positionals, arg)
 	}
 	return append(flags, positionals...)
 }
@@ -289,6 +385,293 @@ func runSample(opts runOptions) error {
 		return errExit(dockerStatus)
 	}
 	return nil
+}
+
+func inspectTarget(opts inspectOptions) error {
+	target, err := filepath.Abs(opts.target)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		return fmt.Errorf("target not found: %s", target)
+	}
+
+	runID := "inspect-" + time.Now().Format("20060102-150405") + "-" + shortID()
+	reportsRoot, err := filepath.Abs(opts.reportsDir)
+	if err != nil {
+		return err
+	}
+	reportDir := filepath.Join(reportsRoot, runID)
+	if err := os.MkdirAll(reportDir, 0o755); err != nil {
+		return err
+	}
+
+	report := inspectReport{
+		RunID:       runID,
+		TargetPath:  target,
+		TargetName:  filepath.Base(target),
+		IsDirectory: info.IsDir(),
+		Size:        info.Size(),
+		Extension:   strings.ToLower(filepath.Ext(target)),
+		StartedAt:   time.Now().Format(time.RFC3339),
+		Notes:       []string{"Static inspection only. Target was not executed."},
+	}
+
+	if info.IsDir() {
+		report.FileType = "directory"
+		report.Entries = inspectDirectory(target, opts.maxEntries)
+	} else {
+		if err := inspectFile(target, opts, &report); err != nil {
+			return err
+		}
+	}
+
+	if err := writeJSON(filepath.Join(reportDir, "inspect.json"), report); err != nil {
+		return err
+	}
+	printInspectSummary(report, reportDir)
+	return nil
+}
+
+func inspectFile(path string, opts inspectOptions, report *inspectReport) error {
+	head, err := readHead(path, 512)
+	if err != nil {
+		return err
+	}
+
+	report.SHA256 = mustDigest(path, sha256.New())
+	report.SHA1 = mustDigest(path, sha1.New())
+	report.MagicHex = hex.EncodeToString(head[:min(len(head), 16)])
+	report.MIME = http.DetectContentType(head)
+	report.FileType = detectFileType(head, report.Extension)
+	report.Strings = extractPrintableStrings(path, opts.stringsLimit)
+
+	switch report.FileType {
+	case "windows-pe":
+		report.PE = inspectPE(path)
+	case "linux-elf":
+		report.ELF = inspectELF(path)
+	case "zip", "docx", "xlsx", "pptx", "jar":
+		report.Entries = inspectZip(path, opts.maxEntries)
+	case "pdf":
+		report.Notes = append(report.Notes, "PDF was not opened with a viewer. Use strings and metadata for first-pass analysis.")
+	}
+	return nil
+}
+
+func readHead(path string, limit int) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	buf := make([]byte, limit)
+	n, err := file.Read(buf)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	return buf[:n], nil
+}
+
+func detectFileType(head []byte, ext string) string {
+	switch {
+	case len(head) >= 4 && string(head[:4]) == "%PDF":
+		return "pdf"
+	case len(head) >= 2 && head[0] == 'M' && head[1] == 'Z':
+		return "windows-pe"
+	case len(head) >= 4 && head[0] == 0x7f && head[1] == 'E' && head[2] == 'L' && head[3] == 'F':
+		return "linux-elf"
+	case len(head) >= 4 && head[0] == 'P' && head[1] == 'K' && head[2] == 0x03 && head[3] == 0x04:
+		return zipTypeFromExt(ext)
+	}
+	if ext != "" {
+		return strings.TrimPrefix(ext, ".")
+	}
+	return "unknown"
+}
+
+func zipTypeFromExt(ext string) string {
+	switch ext {
+	case ".docx":
+		return "docx"
+	case ".xlsx":
+		return "xlsx"
+	case ".pptx":
+		return "pptx"
+	case ".jar":
+		return "jar"
+	default:
+		return "zip"
+	}
+}
+
+func inspectPE(path string) map[string]any {
+	file, err := pe.Open(path)
+	if err != nil {
+		return map[string]any{"error": err.Error()}
+	}
+	defer file.Close()
+
+	sections := make([]string, 0, len(file.Sections))
+	for _, section := range file.Sections {
+		sections = append(sections, section.Name)
+	}
+	return map[string]any{
+		"machine":             fmt.Sprintf("0x%x", file.FileHeader.Machine),
+		"number_of_sections":  file.FileHeader.NumberOfSections,
+		"time_date_stamp":     file.FileHeader.TimeDateStamp,
+		"characteristics":     fmt.Sprintf("0x%x", file.FileHeader.Characteristics),
+		"section_names":       sections,
+		"imported_libraries":  importedLibraries(file),
+		"has_import_metadata": len(importedLibraries(file)) > 0,
+	}
+}
+
+func importedLibraries(file *pe.File) []string {
+	libs, err := file.ImportedLibraries()
+	if err != nil {
+		return nil
+	}
+	sort.Strings(libs)
+	return libs
+}
+
+func inspectELF(path string) map[string]any {
+	file, err := elf.Open(path)
+	if err != nil {
+		return map[string]any{"error": err.Error()}
+	}
+	defer file.Close()
+
+	sections := make([]string, 0, len(file.Sections))
+	for _, section := range file.Sections {
+		sections = append(sections, section.Name)
+	}
+	if len(sections) > 40 {
+		sections = sections[:40]
+	}
+	return map[string]any{
+		"class":         file.Class.String(),
+		"data":          file.Data.String(),
+		"osabi":         file.OSABI.String(),
+		"type":          file.Type.String(),
+		"machine":       file.Machine.String(),
+		"entry":         fmt.Sprintf("0x%x", file.Entry),
+		"section_names": sections,
+	}
+}
+
+func inspectZip(path string, maxEntries int) []archiveEntry {
+	reader, err := zip.OpenReader(path)
+	if err != nil {
+		return []archiveEntry{{Path: "zip error: " + err.Error()}}
+	}
+	defer reader.Close()
+
+	entries := make([]archiveEntry, 0, min(len(reader.File), maxEntries))
+	for i, file := range reader.File {
+		if i >= maxEntries {
+			break
+		}
+		entries = append(entries, archiveEntry{
+			Path:         file.Name,
+			Size:         int64(file.UncompressedSize64),
+			Compressed:   int64(file.CompressedSize64),
+			IsDirectory:  file.FileInfo().IsDir(),
+			ModifiedTime: file.Modified.Format(time.RFC3339),
+		})
+	}
+	return entries
+}
+
+func inspectDirectory(path string, maxEntries int) []archiveEntry {
+	entries := []archiveEntry{}
+	_ = filepath.WalkDir(path, func(current string, entry os.DirEntry, err error) error {
+		if err != nil || current == path {
+			return nil
+		}
+		if len(entries) >= maxEntries {
+			return filepath.SkipAll
+		}
+		info, statErr := entry.Info()
+		if statErr != nil {
+			return nil
+		}
+		rel, relErr := filepath.Rel(path, current)
+		if relErr != nil {
+			rel = current
+		}
+		entries = append(entries, archiveEntry{
+			Path:         filepath.ToSlash(rel),
+			Size:         info.Size(),
+			IsDirectory:  entry.IsDir(),
+			ModifiedTime: info.ModTime().Format(time.RFC3339),
+		})
+		return nil
+	})
+	return entries
+}
+
+func extractPrintableStrings(path string, limit int) []string {
+	if limit == 0 {
+		return nil
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+
+	const maxBytes = 2 * 1024 * 1024
+	reader := io.LimitReader(file, maxBytes)
+	var values []string
+	var current strings.Builder
+	buf := make([]byte, 32*1024)
+	for {
+		n, readErr := reader.Read(buf)
+		for _, b := range buf[:n] {
+			if b >= 32 && b <= 126 {
+				current.WriteByte(b)
+				continue
+			}
+			values = flushString(values, &current, limit)
+			if len(values) >= limit {
+				return values
+			}
+		}
+		if readErr != nil {
+			break
+		}
+	}
+	values = flushString(values, &current, limit)
+	return values
+}
+
+func flushString(values []string, current *strings.Builder, limit int) []string {
+	if current.Len() >= 4 {
+		values = appendUnique(values, current.String(), limit)
+	}
+	current.Reset()
+	return values
+}
+
+func printInspectSummary(report inspectReport, reportDir string) {
+	fmt.Println("Inspect summary")
+	fmt.Printf("- Target: %s\n", report.TargetPath)
+	fmt.Printf("- Type: %s\n", report.FileType)
+	fmt.Printf("- Size: %d bytes\n", report.Size)
+	if report.SHA256 != "" {
+		fmt.Printf("- SHA256: %s\n", report.SHA256)
+	}
+	if len(report.Entries) > 0 {
+		fmt.Printf("- Entries captured: %d\n", len(report.Entries))
+	}
+	if len(report.Strings) > 0 {
+		fmt.Printf("- Strings captured: %d\n", len(report.Strings))
+	}
+	fmt.Printf("\nFull report: %s\n", filepath.Join(reportDir, "inspect.json"))
 }
 
 func summarize(reportDir string, dockerStatus int, elapsed float64) summary {
@@ -515,6 +898,13 @@ func round(value float64, places int) float64 {
 		scale *= 10
 	}
 	return float64(int(value*scale+0.5)) / scale
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 type cliError struct {

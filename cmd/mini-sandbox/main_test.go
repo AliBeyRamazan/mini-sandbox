@@ -15,6 +15,35 @@ func TestNormalizeRunArgsAllowsFlagsAfterSample(t *testing.T) {
 	}
 }
 
+func TestNormalizeInspectArgsAllowsFlagsAfterTarget(t *testing.T) {
+	got := normalizeInspectArgs([]string{"./file.pdf", "--strings-limit", "25", "--max-entries=10"})
+	want := []string{"--strings-limit", "25", "--max-entries=10", "./file.pdf"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("normalizeInspectArgs() = %#v, want %#v", got, want)
+	}
+}
+
+func TestDetectFileType(t *testing.T) {
+	tests := []struct {
+		name string
+		head []byte
+		ext  string
+		want string
+	}{
+		{name: "pdf", head: []byte("%PDF-1.7"), ext: ".pdf", want: "pdf"},
+		{name: "pe", head: []byte("MZ\x90\x00"), ext: ".exe", want: "windows-pe"},
+		{name: "elf", head: []byte{0x7f, 'E', 'L', 'F'}, ext: "", want: "linux-elf"},
+		{name: "docx", head: []byte{'P', 'K', 0x03, 0x04}, ext: ".docx", want: "docx"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := detectFileType(tt.head, tt.ext); got != tt.want {
+				t.Fatalf("detectFileType() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestExtractSyscalls(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "strace.log")

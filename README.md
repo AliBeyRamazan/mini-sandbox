@@ -10,6 +10,7 @@ Toplanan esas melumatlar:
 - sample-in `stdout` ve `stderr` cixislari
 - SHA1/SHA256 hash, olcu ve icra metadata-si
 - qisa `summary.json` xulasesi
+- `inspect` rejimi ile PDF, EXE, ZIP, DOCX ve qovluqlarin statik analizi
 
 > Vacib: bu layihe tehsil ve laborator analiz ucundur. Namelum ve real malware fayllarini esas is sisteminde isletmeyin. Ayrica VM, snapshot ve izolyasiya olunmus laboratoriya istifade edin.
 
@@ -203,6 +204,34 @@ Lazim olanda silmek:
 
 ```bash
 docker rm <container-name>
+```
+
+### Fayli icra etmeden statik analiz etmek
+
+PDF, Windows EXE, ZIP, DOCX ve qovluq kimi obyektleri icra etmeden ilk baxishdan kecirmek ucun `inspect` istifade olunur:
+
+```bash
+./mini-sandbox inspect ./file.pdf
+./mini-sandbox inspect ./sample.exe
+./mini-sandbox inspect ./archive.zip
+./mini-sandbox inspect ./folder
+```
+
+Bu komanda Docker konteyner baslatmir ve fayli acmir/ise salmir. Yalniz statik melumatlari toplayir:
+
+- hash-ler
+- fayl tipi
+- MIME tipi
+- magic bytes
+- printable strings
+- PE/ELF metadata
+- ZIP/DOCX daxili fayl siyahisi
+- qovluq icindeki fayl siyahisi
+
+Netice:
+
+```text
+reports/inspect-<run-id>/inspect.json
 ```
 
 ## Ssenarilere gore istifade
@@ -522,6 +551,137 @@ Bu axin ne edir:
 - reportlari `lab-reports` altinda saxlayir
 - xulase ve sistem cagirislarini oxumaq imkani verir
 
+### Ssenari 15: PDF faylini sandbox mantigi ile yoxlamaq
+
+Meqsed: PDF faylini acmadan ve icra etmeden statik analiz etmek.
+
+```bash
+./mini-sandbox inspect ./document.pdf
+```
+
+Ne vaxt istifade olunur:
+
+- PDF-in hash-lerini hesablamaq isteyirsinizse
+- PDF icinde gorunen stringleri cixarmaq lazimdirsa
+- fayli viewer ile acmadan ilkin risk yoxlamasi etmek isteyirsinizse
+
+Sonra baxilacaq fayl:
+
+```bash
+cat reports/inspect-<run-id>/inspect.json
+```
+
+Qeyd: bu komanda PDF-i vizual olaraq acmir. GUI viewer yoxdur. Bu, tehlukesiz ilk statik baxish ucundur.
+
+### Ssenari 16: Windows EXE faylini icra etmeden yoxlamaq
+
+Meqsed: `.exe` faylinin PE metadata-sini ve import etdiyi library-leri gormek.
+
+```bash
+./mini-sandbox inspect ./sample.exe
+```
+
+Ne vaxt istifade olunur:
+
+- Windows executable faylini Linux sandbox-da native isletmek mumkun deyilse
+- fayli icra etmeden hash, PE section ve import melumatlarini gormek isteyirsinizse
+- dinamik analizden evvel ilkin statik analiz lazimdirsa
+
+Sonra baxilacaq saheler:
+
+```bash
+cat reports/inspect-<run-id>/inspect.json
+```
+
+`inspect.json` icinde bunlara baxin:
+
+- `file_type`
+- `sha256`
+- `pe.section_names`
+- `pe.imported_libraries`
+- `strings`
+
+Qeyd: bu `.exe` faylini isletmir. Windows EXE-ni dinamik analiz etmek ucun elave `run-wine` kimi ayrica rejim lazim olar.
+
+### Ssenari 17: ZIP, DOCX, XLSX ve PPTX fayllarina baxmaq
+
+Meqsed: arxiv veya Office faylinin icindeki fayl siyahisini cixarmaq.
+
+```bash
+./mini-sandbox inspect ./archive.zip
+./mini-sandbox inspect ./document.docx
+./mini-sandbox inspect ./sheet.xlsx
+./mini-sandbox inspect ./slides.pptx
+```
+
+Ne vaxt istifade olunur:
+
+- arxivin icinde hansi fayllar oldugunu gormek isteyirsinizse
+- Office faylinin daxili XML strukturu maraqlidirsa
+- fayli acmadan ilkin analiz lazimdirsa
+
+Daha az ve ya daha cox entry toplamaq ucun:
+
+```bash
+./mini-sandbox inspect ./archive.zip --max-entries 50
+```
+
+Sonra baxilacaq sahe:
+
+```bash
+cat reports/inspect-<run-id>/inspect.json
+```
+
+`entries` bolmesinde arxivin icindeki fayllar gorunecek.
+
+### Ssenari 18: Qovlugu analiz etmek
+
+Meqsed: qovlugu icra etmeden icindeki fayl strukturunu report etmek.
+
+```bash
+./mini-sandbox inspect ./suspicious-folder
+```
+
+Ne vaxt istifade olunur:
+
+- sample bir nece fayldan ibaretdirse
+- qovlugun icinde hansi script, binary ve config fayllar oldugunu gormek isteyirsinizse
+- hansi fayli `run` ile icra edeceyinizi secmek lazimdirsa
+
+Daha cox fayl siyahisi toplamaq ucun:
+
+```bash
+./mini-sandbox inspect ./suspicious-folder --max-entries 500
+```
+
+Sonra reporta baxin:
+
+```bash
+cat reports/inspect-<run-id>/inspect.json
+```
+
+Qeyd: `inspect` qovluqdaki fayllari icra etmir. Yalniz siyahi ve metadata toplayir.
+
+### Ssenari 19: Printable strings sayini azaltmaq veya artirmaq
+
+Meqsed: fayldan cixarilan oxuna bilen string sayini kontrol etmek.
+
+```bash
+./mini-sandbox inspect ./sample.exe --strings-limit 30
+```
+
+Ne vaxt istifade olunur:
+
+- reportun cox boyuk olmasini istemirsinizse
+- yalniz ilk indikatorlari gormek kifayetdirse
+- string analizini daha kontrollu etmek lazimdirsa
+
+String toplamagi sondurmaq ucun:
+
+```bash
+./mini-sandbox inspect ./sample.exe --strings-limit 0
+```
+
 ## Komandalar
 
 ### `build`
@@ -566,6 +726,37 @@ Numune:
 
 ```bash
 ./mini-sandbox run ./samples/test.sh --timeout 20 --reports-dir ./reports
+```
+
+### `inspect`
+
+Fayl ve ya qovlugu icra etmeden statik analiz edir.
+
+```bash
+./mini-sandbox inspect <file-or-directory>
+```
+
+Secimler:
+
+```text
+--reports-dir string   Report qovlugu. Default: reports
+--strings-limit int    Toplanacaq printable string sayi. Default: 80
+--max-entries int      Qovluq/arxiv ucun maksimum entry sayi. Default: 200
+```
+
+Numuneler:
+
+```bash
+./mini-sandbox inspect ./document.pdf
+./mini-sandbox inspect ./sample.exe --strings-limit 40
+./mini-sandbox inspect ./archive.zip --max-entries 100
+./mini-sandbox inspect ./suspicious-folder --reports-dir ./case-001
+```
+
+Netice:
+
+```text
+reports/inspect-<run-id>/inspect.json
 ```
 
 ## Report fayllari
