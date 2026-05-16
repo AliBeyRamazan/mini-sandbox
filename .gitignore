@@ -1,0 +1,21 @@
+# Go build outputs
+/mini-sandbox
+mini-sandbox.exe
+*.test
+*.out
+
+# Sandbox reports and local analysis output
+reports/
+lab-reports/
+case-*/
+my-reports/
+
+# Local/editor files
+.idea/
+.vscode/
+*.swp
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db
